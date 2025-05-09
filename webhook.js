@@ -1,110 +1,92 @@
 
-const express = require('express');
-const axios = require('axios');
-const { GoogleSpreadsheet } = require('google-spreadsheet');
+const express = require("express");
+const bodyParser = require("body-parser");
+const { GoogleSpreadsheet } = require("google-spreadsheet");
+const axios = require("axios");
 
 const app = express();
-app.use(express.json());
+app.use(bodyParser.json());
 
-app.post('/avaliar', async (req, res) => {
+const SHEET_ID = "1eD0AU6OYHclOLfQMGmlD0M6w8_YPyT0DspgFjkJ3rTc"; // ID da planilha "Avaliação de Atendimentos"
+const SHEET_TAB_NAME = "Página1";
+const SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n");
+
+const PROMPT = (pergunta, resposta) => `
+Você é um avaliador técnico de atendimentos ao cliente.
+
+Avalie a seguinte interação com nota de 1 a 5 (onde 1 é muito ruim e 5 é excelente), considerando clareza, empatia e adequação da resposta à pergunta feita.
+
+Formato da saída: JSON com as chaves "nota" (número de 1 a 5) e "comentario" (frase curta explicando o motivo da nota).
+
+Pergunta do cliente: "${pergunta}"
+Resposta do atendente: "${resposta}"
+`;
+
+app.post("/avaliar", async (req, res) => {
   try {
-    const pergunta = req.body.pergunta;
-    const resposta = req.body.resposta;
-    const paginaOrigem = req.body.pagina_origem;
+    const { pergunta, Resposta } = req.body.sessionInfo.parameters;
+    if (!pergunta || !Resposta) {
+      return res.status(400).send("Parâmetros ausentes.");
+    }
 
-    // Cria uma nova thread
-    const thread = await axios.post(
-      'https://api.openai.com/v1/threads',
-      {},
+    const completion = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
       {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    const thread_id = thread.data.id;
-
-    // Envia mensagem para a thread do Assistant
-    await axios.post(
-      `https://api.openai.com/v1/threads/${thread_id}/messages`,
-      {
-        role: 'user',
-        content: `Cliente: ${pergunta}\nAtendente: ${resposta}`
+        model: "gpt-4",
+        messages: [
+          {
+            role: "user",
+            content: PROMPT(pergunta, Resposta),
+          },
+        ],
+        temperature: 0,
       },
       {
         headers: {
           Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json'
-        }
+          "Content-Type": "application/json",
+        },
       }
     );
 
-    // Roda o Assistant na thread
-    const run = await axios.post(
-      `https://api.openai.com/v1/threads/${thread_id}/runs`,
-      {
-        assistant_id: process.env.ASSISTANT_ID
+    const resposta = completion.data.choices[0].message.content.trim();
+    const json = JSON.parse(resposta);
+
+    // Enviar para Google Sheets
+    const doc = new GoogleSpreadsheet(SHEET_ID);
+    await doc.useServiceAccountAuth({
+      client_email: SERVICE_ACCOUNT_EMAIL,
+      private_key: PRIVATE_KEY,
+    });
+    await doc.loadInfo();
+    const sheet = doc.sheetsByTitle[SHEET_TAB_NAME];
+
+    await sheet.addRow({
+      Origem: "Dialogflow CX",
+      Nota: json.nota,
+      Pergunta: pergunta,
+      Resposta: Resposta,
+      Comentario: json.comentario,
+    });
+
+    res.json({
+      fulfillment_response: {
+        messages: [
+          {
+            text: {
+              text: ["Avaliação registrada com sucesso."],
+            },
+          },
+        ],
       },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    // Aguarda conclusão
-    let status = 'in_progress';
-    let result;
-    while (status === 'in_progress') {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      const runStatus = await axios.get(
-        `https://api.openai.com/v1/threads/${thread_id}/runs/${run.data.id}`,
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
-          }
-        }
-      );
-      status = runStatus.data.status;
-    }
-
-    // Busca mensagens finais
-    const messages = await axios.get(
-      `https://api.openai.com/v1/threads/${thread_id}/messages`,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
-        }
-      }
-    );
-
-    const ultima = messages.data.data.find(m => m.role === 'assistant');
-    const jsonMatch = ultima.content[0].text.value.match(/\{.*\}/s);
-    const parsed = JSON.parse(jsonMatch[0]);
-
-    if (parsed.nota <= 2) {
-      const doc = new GoogleSpreadsheet(process.env.SHEET_ID);
-      doc.useApiKey(process.env.GOOGLE_SHEETS_API_KEY);
-      await doc.loadInfo();
-      const sheet = doc.sheetsByIndex[0];
-      await sheet.addRow({
-        Origem: paginaOrigem,
-        Nota: parsed.nota,
-        Pergunta: pergunta,
-        Resposta: resposta,
-        Comentario: parsed.comentario
-      });
-    }
-
-    res.json({ status: 'Avaliação registrada', nota: parsed.nota });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Erro na avaliação' });
+    });
+  } catch (error) {
+    console.error("Erro:", error.message);
+    res.status(500).send("Erro interno no webhook.");
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+app.listen(10000, () => {
+  console.log("Servidor rodando na porta 10000");
+});
