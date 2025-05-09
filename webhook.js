@@ -1,92 +1,81 @@
 
-const express = require("express");
-const bodyParser = require("body-parser");
-const { GoogleSpreadsheet } = require("google-spreadsheet");
-const axios = require("axios");
-
+const express = require('express');
+const bodyParser = require('body-parser');
+const { google } = require('googleapis');
+const axios = require('axios');
 const app = express();
 app.use(bodyParser.json());
 
-const SHEET_ID = "1eD0AU6OYHclOLfQMGmlD0M6w8_YPyT0DspgFjkJ3rTc"; // ID da planilha "Avaliação de Atendimentos"
-const SHEET_TAB_NAME = "Página1";
-const SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n");
+const OPENAI_API_KEY = 'SUA_CHAVE_OPENAI';
+const SHEET_ID = 'SUA_ID_PLANILHA';
+const SHEET_NAME = 'Avaliação de Atendimentos';
 
-const PROMPT = (pergunta, resposta) => `
-Você é um avaliador técnico de atendimentos ao cliente.
+// Autenticador do Google Sheets
+const auth = new google.auth.GoogleAuth({
+  keyFile: 'credentials.json',
+  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+});
 
-Avalie a seguinte interação com nota de 1 a 5 (onde 1 é muito ruim e 5 é excelente), considerando clareza, empatia e adequação da resposta à pergunta feita.
+async function appendToSheet(origem, pergunta, resposta, nota, comentario) {
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth: client });
 
-Formato da saída: JSON com as chaves "nota" (número de 1 a 5) e "comentario" (frase curta explicando o motivo da nota).
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!A:E`,
+    valueInputOption: 'RAW',
+    requestBody: {
+      values: [[origem, nota, pergunta, resposta, comentario]],
+    },
+  });
+}
 
-Pergunta do cliente: "${pergunta}"
-Resposta do atendente: "${resposta}"
-`;
-
-app.post("/avaliar", async (req, res) => {
+app.post('/avaliar', async (req, res) => {
   try {
-    const { pergunta, Resposta } = req.body.sessionInfo.parameters;
-    if (!pergunta || !Resposta) {
-      return res.status(400).send("Parâmetros ausentes.");
+    const { pergunta, resposta } = req.body;
+
+    if (!pergunta || !resposta) {
+      return res.status(400).json({ error: 'Parâmetros pergunta e resposta obrigatórios' });
     }
 
-    const completion = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4",
-        messages: [
-          {
-            role: "user",
-            content: PROMPT(pergunta, Resposta),
-          },
-        ],
-        temperature: 0,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
+    const completion = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model: 'gpt-4o',
+      messages: [
+        {
+          role: 'system',
+          content: `Você é um avaliador técnico. Avalie a qualidade da resposta de um atendente para a pergunta de um cliente.
+Retorne apenas um JSON no formato:
+{
+  "nota": número de 1 a 5,
+  "comentario": comentário técnico
+}
+Analise tecnicamente, considerando clareza, empatia e objetividade.`
         },
+        {
+          role: 'user',
+          content: `Pergunta: ${pergunta}
+Resposta: ${resposta}`
+        }
+      ]
+    }, {
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
       }
-    );
-
-    const resposta = completion.data.choices[0].message.content.trim();
-    const json = JSON.parse(resposta);
-
-    // Enviar para Google Sheets
-    const doc = new GoogleSpreadsheet(SHEET_ID);
-    await doc.useServiceAccountAuth({
-      client_email: SERVICE_ACCOUNT_EMAIL,
-      private_key: PRIVATE_KEY,
-    });
-    await doc.loadInfo();
-    const sheet = doc.sheetsByTitle[SHEET_TAB_NAME];
-
-    await sheet.addRow({
-      Origem: "Dialogflow CX",
-      Nota: json.nota,
-      Pergunta: pergunta,
-      Resposta: Resposta,
-      Comentario: json.comentario,
     });
 
-    res.json({
-      fulfillment_response: {
-        messages: [
-          {
-            text: {
-              text: ["Avaliação registrada com sucesso."],
-            },
-          },
-        ],
-      },
-    });
-  } catch (error) {
-    console.error("Erro:", error.message);
-    res.status(500).send("Erro interno no webhook.");
+    const resultado = completion.data.choices[0].message.content.trim();
+    const parsed = JSON.parse(resultado);
+
+    await appendToSheet('Dialogflow', pergunta, resposta, parsed.nota, parsed.comentario);
+    res.status(200).json({ nota: parsed.nota, comentario: parsed.comentario });
+  } catch (err) {
+    console.error('Erro no webhook:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Erro ao processar avaliação' });
   }
 });
 
-app.listen(10000, () => {
-  console.log("Servidor rodando na porta 10000");
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`Servidor rodando na porta ${PORT}`);
 });
