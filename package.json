@@ -1,15 +1,11 @@
+
 {
   "name": "webhook-avaliador",
   "version": "1.0.0",
-  "description": "Webhook para avaliação de atendimento via ChatGPT",
   "main": "webhook.js",
-  "type": "module",
-  "scripts": {
-    "start": "node webhook.js"
-  },
   "dependencies": {
-    "axios": "^1.5.0",
+    "axios": "^1.6.0",
     "express": "^4.18.2",
-    "dotenv": "^16.3.1"
+    "google-spreadsheet": "^3.3.0"
   }
 }
