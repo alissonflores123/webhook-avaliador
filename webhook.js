@@ -1,109 +1,118 @@
-const express = require('express');
-const axios = require('axios');
-const { GoogleSpreadsheet } = require('google-spreadsheet');
-const app = express();
-app.use(express.json());
-const PORT = process.env.PORT || 10000;
+import express from 'express';
+import bodyParser from 'body-parser';
+import axios from 'axios';
+import dotenv from 'dotenv';
+import { google } from 'googleapis';
 
-const SHEET_ID = process.env.SHEET_ID;
-const GOOGLE_SHEETS_API_KEY = process.env.GOOGLE_SHEETS_API_KEY;
-const ASSISTANT_ID = process.env.ASSISTANT_ID;
+dotenv.config();
+const app = express();
+app.use(bodyParser.json());
+
+const PORT = process.env.PORT || 10000;
+const GOOGLE_SHEET_ID = process.env.SHEET_ID;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const ASSISTANT_ID = process.env.ASSISTANT_ID;
 
 app.post('/avaliar', async (req, res) => {
-  try {
-    const { pergunta, resposta, pagina_origem, thread_id } = req.body;
+  const params = req.body.sessionInfo?.parameters || {};
+  const pergunta = params.pergunta || '';
+  const resposta = params.Resposta || '';
+  const origem = params.texto || '';
 
-    let thread = thread_id;
-    if (!thread) {
-      const created = await axios.post("https://api.openai.com/v1/threads", {
-        messages: []
-      }, {
+  if (!pergunta || !resposta) return res.status(400).send('Dados incompletos');
+
+  try {
+    const completion = await axios.post(
+      `https://api.openai.com/v1/assistants/${ASSISTANT_ID}/threads`,
+      {
+        messages: [
+          {
+            role: 'user',
+            content: `Avalie a seguinte resposta de atendimento ao cliente de 1 a 5, onde 1 é péssima e 5 é excelente. Retorne apenas um JSON com as chaves "nota" (número) e "justificativa" (texto).
+            
+Cliente: ${pergunta}
+Atendente: ${resposta}`
+          }
+        ]
+      },
+      {
         headers: {
           Authorization: `Bearer ${OPENAI_API_KEY}`,
           'Content-Type': 'application/json'
         }
-      });
-      thread = created.data.id;
-    }
-
-    await axios.post(`https://api.openai.com/v1/threads/${thread}/messages`, {
-      role: "user",
-      content: `Avalie de 1 a 5 a seguinte resposta que o bot deu ao cliente.
-
-Cliente: ${pergunta}
-Bot: ${resposta}
-
-Responda apenas no formato JSON: {"nota": X, "justificativa": "texto explicando a nota"}`,
-    }, {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
       }
-    });
+    );
 
-    const run = await axios.post(`https://api.openai.com/v1/threads/${thread}/runs`, {
-      assistant_id: ASSISTANT_ID
-    }, {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    let status = "queued";
-    let ultima = null;
-    while (status !== "completed") {
-      const check = await axios.get(`https://api.openai.com/v1/threads/${thread}/runs/${run.data.id}`, {
+    const thread_id = completion.data.id;
+    const response = await axios.post(
+      `https://api.openai.com/v1/assistants/${ASSISTANT_ID}/threads/${thread_id}/runs`,
+      { assistant_id: ASSISTANT_ID },
+      {
         headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
         }
+      }
+    );
+
+    let status = 'in_progress';
+    let output;
+    while (status === 'in_progress' || status === 'queued') {
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      const result = await axios.get(
+        `https://api.openai.com/v1/assistants/${ASSISTANT_ID}/threads/${thread_id}/runs/${response.data.id}`,
+        {
+          headers: {
+            Authorization: `Bearer ${OPENAI_API_KEY}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      status = result.data.status;
+    }
+
+    const messages = await axios.get(
+      `https://api.openai.com/v1/assistants/${ASSISTANT_ID}/threads/${thread_id}/messages`,
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const respostaIA = messages.data.data[0]?.content[0]?.text?.value;
+    console.log('Resposta da IA:', respostaIA);
+
+    const resultado = JSON.parse(respostaIA);
+    const nota = parseInt(resultado.nota);
+    const justificativa = resultado.justificativa;
+
+    if (nota <= 2) {
+      const auth = new google.auth.GoogleAuth({
+        credentials: {
+          client_email: process.env.GOOGLE_CLIENT_EMAIL,
+          private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\n/g, '
+'),
+        },
+        scopes: ['https://www.googleapis.com/auth/spreadsheets'],
       });
-      status = check.data.status;
-      await new Promise(r => setTimeout(r, 1000));
-    }
 
-    const mensagens = await axios.get(`https://api.openai.com/v1/threads/${thread}/messages`, {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`
-      }
-    });
-
-    for (const msg of mensagens.data.data) {
-      if (msg.role === "assistant") {
-        ultima = msg;
-        break;
-      }
-    }
-
-    let parsed = null;
-    try {
-      const jsonMatch = ultima.content[0].text.value.match(/\{.*\}/s);
-      if (jsonMatch) {
-        parsed = JSON.parse(jsonMatch[0]);
-      }
-    } catch (e) {
-      console.error("Erro ao parsear JSON:", e.message);
-    }
-
-    if (parsed && parsed.nota <= 2) {
-      const doc = new GoogleSpreadsheet(SHEET_ID);
-      await doc.useApiKey(GOOGLE_SHEETS_API_KEY);
-      await doc.loadInfo();
-      const sheet = doc.sheetsByIndex[0];
-      await sheet.addRow({
-        pergunta,
-        resposta,
-        nota: parsed.nota,
-        justificativa: parsed.justificativa,
-        origem: pagina_origem
+      const sheets = google.sheets({ version: 'v4', auth });
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: GOOGLE_SHEET_ID,
+        range: 'Página1!A1',
+        valueInputOption: 'RAW',
+        requestBody: {
+          values: [[pergunta, resposta, nota, justificativa, origem]],
+        },
       });
     }
 
-    res.json({ ok: true });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send('Erro ao processar a avaliação');
+    res.json({ status: 'ok' });
+  } catch (err) {
+    console.error('Erro ao processar webhook:', err?.response?.data || err.message);
+    res.status(500).send('Erro ao processar webhook');
   }
 });
 
