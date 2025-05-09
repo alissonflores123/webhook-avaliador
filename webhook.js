@@ -1,75 +1,110 @@
-import express from 'express';
-import axios from 'axios';
-import bodyParser from 'body-parser';
-import { GoogleAuth } from 'google-auth-library';
+
+const express = require('express');
+const axios = require('axios');
+const { GoogleSpreadsheet } = require('google-spreadsheet');
 
 const app = express();
-app.use(bodyParser.json());
-
-const auth = new GoogleAuth({
-  credentials: {
-    client_email: process.env.GOOGLE_CLIENT_EMAIL,
-    private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\n/g, '\n'),
-  },
-  scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-});
+app.use(express.json());
 
 app.post('/avaliar', async (req, res) => {
   try {
-    const pergunta = req.body.sessionInfo?.parameters?.pergunta || 'Sem pergunta';
-    const thread_id = req.body.sessionInfo?.parameters?.thread_id;
+    const pergunta = req.body.pergunta;
+    const resposta = req.body.resposta;
+    const paginaOrigem = req.body.pagina_origem;
 
-    const headers = {
-      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
-    };
-
-    const messages = [
+    // Cria uma nova thread
+    const thread = await axios.post(
+      'https://api.openai.com/v1/threads',
+      {},
       {
-        role: 'user',
-        content: `Avalie a pergunta do cliente: "${pergunta}" e classifique com apenas uma palavra como: rastreio, cancelamento, notafiscal, montagem, posvenda, prevena.`
-      }
-    ];
-
-    const threadResponse = await axios.post('https://api.openai.com/v1/threads', {
-      messages: messages
-    }, { headers });
-
-    const threadId = threadResponse.data.id;
-
-    const runResponse = await axios.post(`https://api.openai.com/v1/threads/${threadId}/runs`, {
-      assistant_id: process.env.OPENAI_ASSISTANT_ID
-    }, { headers });
-
-    const runId = runResponse.data.id;
-
-    let result;
-    for (let i = 0; i < 10; i++) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      const check = await axios.get(`https://api.openai.com/v1/threads/${threadId}/runs/${runId}`, { headers });
-      if (check.data.status === 'completed') {
-        result = await axios.get(`https://api.openai.com/v1/threads/${threadId}/messages`, { headers });
-        break;
-      }
-    }
-
-    const resposta = result?.data?.data?.[0]?.content?.[0]?.text?.value || 'erro';
-
-    res.json({
-      sessionInfo: {
-        parameters: {
-          resposta_gpt: resposta,
-          thread_id: threadId
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
         }
       }
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send('Erro no processamento');
+    );
+
+    const thread_id = thread.data.id;
+
+    // Envia mensagem para a thread do Assistant
+    await axios.post(
+      `https://api.openai.com/v1/threads/${thread_id}/messages`,
+      {
+        role: 'user',
+        content: `Cliente: ${pergunta}\nAtendente: ${resposta}`
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    // Roda o Assistant na thread
+    const run = await axios.post(
+      `https://api.openai.com/v1/threads/${thread_id}/runs`,
+      {
+        assistant_id: process.env.ASSISTANT_ID
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    // Aguarda conclusão
+    let status = 'in_progress';
+    let result;
+    while (status === 'in_progress') {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const runStatus = await axios.get(
+        `https://api.openai.com/v1/threads/${thread_id}/runs/${run.data.id}`,
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+          }
+        }
+      );
+      status = runStatus.data.status;
+    }
+
+    // Busca mensagens finais
+    const messages = await axios.get(
+      `https://api.openai.com/v1/threads/${thread_id}/messages`,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+        }
+      }
+    );
+
+    const ultima = messages.data.data.find(m => m.role === 'assistant');
+    const jsonMatch = ultima.content[0].text.value.match(/\{.*\}/s);
+    const parsed = JSON.parse(jsonMatch[0]);
+
+    if (parsed.nota <= 2) {
+      const doc = new GoogleSpreadsheet(process.env.SHEET_ID);
+      doc.useApiKey(process.env.GOOGLE_SHEETS_API_KEY);
+      await doc.loadInfo();
+      const sheet = doc.sheetsByIndex[0];
+      await sheet.addRow({
+        Origem: paginaOrigem,
+        Nota: parsed.nota,
+        Pergunta: pergunta,
+        Resposta: resposta,
+        Comentario: parsed.comentario
+      });
+    }
+
+    res.json({ status: 'Avaliação registrada', nota: parsed.nota });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro na avaliação' });
   }
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
