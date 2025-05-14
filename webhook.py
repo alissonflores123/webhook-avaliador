@@ -60,15 +60,8 @@ def webhook():
         response_text = messages.data[0].content[0].text.value if messages.data else "Desculpe, não entendi."
 
         # Validar se o retorno do chatGPT é apenas uma palavra
-        if (' ' not in response_text):
+        if ' ' not in response_text:
             return jsonify({
-                "fulfillment_response": {
-                    "messages": [{
-                        "text": {
-                            "text": ''
-                        }
-                    }]
-                },
                 "session_info": {
                     "parameters": {
                         "thread_id": thread_id,
