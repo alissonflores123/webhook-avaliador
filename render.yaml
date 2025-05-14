@@ -7,5 +7,3 @@ services:
     envVars:
       - key: OPENAI_API_KEY
         value: YOUR_OPENAI_API_KEY_HERE
-      - key: ASSISTANT_ID
-        value: YOUR_ASSISTANT_ID_HERE
