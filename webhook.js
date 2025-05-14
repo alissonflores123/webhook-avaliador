@@ -1,81 +1,110 @@
+import os
+import openai
+import time
+import traceback
+import re
+from flask import Flask, request, jsonify
 
-const express = require('express');
-const bodyParser = require('body-parser');
-const { google } = require('googleapis');
-const axios = require('axios');
-const app = express();
-app.use(bodyParser.json());
+app = Flask(__name__)
 
-const OPENAI_API_KEY = 'SUA_CHAVE_OPENAI';
-const SHEET_ID = 'SUA_ID_PLANILHA';
-const SHEET_NAME = 'Avaliação de Atendimentos';
+openai.api_key = os.getenv("OPENAI_API_KEY")
+ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 
-// Autenticador do Google Sheets
-const auth = new google.auth.GoogleAuth({
-  keyFile: 'credentials.json',
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-});
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    try:
+        data = request.get_json()
+        user_input = data.get("text", "")
+        session_params = data.get("sessionInfo", {}).get("parameters", {})
+        thread_id = session_params.get("thread_id")
+        ASSISTANT_ID = session_params.get("assistant_id")
 
-async function appendToSheet(origem, pergunta, resposta, nota, comentario) {
-  const client = await auth.getClient();
-  const sheets = google.sheets({ version: 'v4', auth: client });
+        # Validar se o thread_id tem formato correto
+        valid_id = lambda x: isinstance(x, str) and re.match(r"^[\w-]+$", x)
+        if not valid_id(thread_id):
+            thread = openai.beta.threads.create()
+            thread_id = thread.id 
 
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A:E`,
-    valueInputOption: 'RAW',
-    requestBody: {
-      values: [[origem, nota, pergunta, resposta, comentario]],
-    },
-  });
-}
+        # Adicionar os parâmetros do Dialogflow no início da mensagem do usuário
+        if session_params:
+            contexto = "\n".join([f"{k}: {v}" for k, v in session_params.items() if (k != "thread_id" and k != "assistant_id")])
+            mensagem_final = f"Contexto fornecido pelo sistema:\n{contexto}\n\nMensagem do cliente:\n{user_input}"
+        else:
+            mensagem_final = user_input
 
-app.post('/avaliar', async (req, res) => {
-  try {
-    const { pergunta, resposta } = req.body;
+        # Enviar a mensagem consolidada
+        openai.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=mensagem_final
+        )
 
-    if (!pergunta || !resposta) {
-      return res.status(400).json({ error: 'Parâmetros pergunta e resposta obrigatórios' });
-    }
+        # Executar assistant
+        run = openai.beta.threads.runs.create(
+            thread_id=thread_id,
+            assistant_id=ASSISTANT_ID
+        )
 
-    const completion = await axios.post('https://api.openai.com/v1/chat/completions', {
-      model: 'gpt-4o',
-      messages: [
-        {
-          role: 'system',
-          content: `Você é um avaliador técnico. Avalie a qualidade da resposta de um atendente para a pergunta de um cliente.
-Retorne apenas um JSON no formato:
-{
-  "nota": número de 1 a 5,
-  "comentario": comentário técnico
-}
-Analise tecnicamente, considerando clareza, empatia e objetividade.`
-        },
-        {
-          role: 'user',
-          content: `Pergunta: ${pergunta}
-Resposta: ${resposta}`
-        }
-      ]
-    }, {
-      headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      }
-    });
+        while True:
+            run_status = openai.beta.threads.runs.retrieve(
+                thread_id=thread_id,
+                run_id=run.id
+            )
+            if run_status.status == "completed":
+                break
+            elif run_status.status in ["failed", "cancelled", "expired"]:
+                raise Exception(f"Run falhou: {run_status.status}")
+            time.sleep(0.5)
 
-    const resultado = completion.data.choices[0].message.content.trim();
-    const parsed = JSON.parse(resultado);
+        messages = openai.beta.threads.messages.list(thread_id=thread_id)
+        response_text = messages.data[0].content[0].text.value if messages.data else "Desculpe, não entendi."
 
-    await appendToSheet('Dialogflow', pergunta, resposta, parsed.nota, parsed.comentario);
-    res.status(200).json({ nota: parsed.nota, comentario: parsed.comentario });
-  } catch (err) {
-    console.error('Erro no webhook:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Erro ao processar avaliação' });
-  }
-});
+        # Validar se o retorno do chatGPT é apenas uma palavra
+        if (' ' not in response_text):
+            return jsonify({
+                "fulfillment_response": {
+                    "messages": [{
+                        "text": {
+                            "text": ''
+                        }
+                    }]
+                },
+                "session_info": {
+                    "parameters": {
+                        "thread_id": thread_id,
+                        "resposta_gpt": [response_text]
+                    }
+                }
+            })
+        else:
+            return jsonify({
+                "fulfillment_response": {
+                    "messages": [{
+                        "text": {
+                            "text": [response_text]
+                        }
+                    }]
+                },
+                "session_info": {
+                    "parameters": {
+                        "thread_id": thread_id,
+                        "resposta_gpt": [response_text]
+                    }
+                }
+            })
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
+    except Exception as e:
+        print("Erro:", str(e))
+        traceback.print_exc()
+        return jsonify({
+            "fulfillment_response": {
+                "messages": [{
+                    "text": {
+                        "text": ["Erro interno no webhook."]
+                    }
+                }]
+            }
+        }), 500
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
